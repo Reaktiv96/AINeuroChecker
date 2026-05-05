@@ -17,8 +17,10 @@
 ## Скриншоты
 <img width="1648" height="679" alt="GAIS1" src="https://github.com/user-attachments/assets/c5823409-9a1b-404a-b191-7bb5741a4615" />
 Общий вид приложения
+
 <img width="1449" height="776" alt="GAIS3" src="https://github.com/user-attachments/assets/e074b084-6a29-47c3-b837-1f3fcac14d4c" />
 Сравнение работы промтов
+
 <img width="1419" height="284" alt="GAIS4" src="https://github.com/user-attachments/assets/1c69e182-7dad-48d7-b095-584d2b37e136" />
 Панель с запускаемым кодом
 
