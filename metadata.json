@@ -1,0 +1,6 @@
+{
+  "name": "AI Homework Checker",
+  "description": "Автоматизированная система проверки домашних заданий с генерацией синтетических кейсов и встроенным Python-редактором",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

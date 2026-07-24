@@ -1,0 +1,1770 @@
+
+
+=====================
+# Содержимое файла temp/files/117218/4c802506/1AZURY0y3KKus1KpOKv-SiJ7s3VLKpvtX.ipynb:
+Cell type: code
+Source: import subprocess, sys
+for _pkg, _mod in [("python-telegram-bot", "telegram"), ("sentence-transformers", "sentence_transformers"),
+                    ("numpy", "numpy"), ("requests", "requests")]:
+    try:
+        __import__(_mod)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", _pkg])
+
+import asyncio
+import base64
+import csv
+import enum
+import io
+import json
+import logging
+import os
+import re
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    BASE_DIR = Path(__file__).parent.resolve()
+except NameError:
+    BASE_DIR = Path.cwd()
+
+TIER_RANK = {"эконом":1, "стандарт":2, "комфорт":3, "бизнес":4, "апартаменты":5, "полулюкс":6, "люкс":7}
+
+
+# ============================================================
+# СТРОГИЕ ENUM — ни строк, ни догадок
+# ============================================================
+
+class GenType(enum.Enum):
+    GREETING          = "GREETING"
+    ONBOARDING        = "ONBOARDING"
+    ONBOARDING_READY  = "ONBOARDING_READY"
+    SEARCH            = "SEARCH"
+    UPSELL            = "UPSELL"
+    NOTHING_FOUND     = "NOTHING_FOUND"
+    ALL_SHOWN         = "ALL_SHOWN"
+    BOOKING           = "BOOKING"
+    BOOKING_LIST      = "BOOKING_LIST"
+    BOOKING_CANCELLED = "BOOKING_CANCELLED"
+    SHOW_PHOTOS       = "SHOW_PHOTOS"
+    OFF_TOPIC         = "OFF_TOPIC"
+    CHANGE            = "CHANGE"
+    BUDGET            = "BUDGET"
+    STATE             = "STATE"
+    QUESTION          = "QUESTION"
+
+
+class Button(enum.Enum):
+    PHOTO           = "PHOTO"
+    NEXT_ROOM       = "NEXT_ROOM"
+    BOOK            = "BOOK"
+    NOT_SUITABLE    = "NOT_SUITABLE"
+    FIX_PARAMS      = "FIX_PARAMS"
+    CHANGE_PARAMS   = "CHANGE_PARAMS"
+    INCREASE_BUDGET = "INCREASE_BUDGET"
+    SHOW_BOOKINGS   = "SHOW_BOOKINGS"
+    START_SEARCH    = "START_SEARCH"
+    RESET           = "RESET"
+
+
+BUTTON_LABELS = {
+    Button.PHOTO:           "Показать фото",
+    Button.NEXT_ROOM:       "Показать другой",
+    Button.BOOK:            "Забронировать",
+    Button.NOT_SUITABLE:    "Не подходит",
+    Button.FIX_PARAMS:      "Внести исправления",
+    Button.CHANGE_PARAMS:   "Изменить параметры",
+    Button.INCREASE_BUDGET: "Изменить бюджет",
+    Button.SHOW_BOOKINGS:   "Мои брони",
+    Button.START_SEARCH:    "Подобрать варианты",
+    Button.RESET:           "Начать заново 🔄",
+}
+
+BUTTON_CALLBACKS = {
+    Button.PHOTO:           lambda r: f"photo:{r or 0}",
+    Button.NEXT_ROOM:       lambda r: "nav:next",
+    Button.BOOK:            lambda r: "ai:Забронировать",
+    Button.NOT_SUITABLE:    lambda r: "ai:Не подходит",
+    Button.FIX_PARAMS:      lambda r: "nav:fix_params",
+    Button.CHANGE_PARAMS:   lambda r: "ai:Изменить параметры",
+    Button.INCREASE_BUDGET: lambda r: "ai:Изменить бюджет",
+    Button.SHOW_BOOKINGS:   lambda r: "nav:show_bookings",
+    Button.START_SEARCH:    lambda r: "ai:Подобрать варианты",
+    Button.RESET:           lambda r: "nav:reset",
+}
+
+REQUIRED_FIELDS = ["guest_name", "checkin_date", "checkout_date", "adults"]
+
+NLU_STATE_FIELDS = {"guest_name", "adults", "children", "checkin_date",
+                    "checkout_date", "budget_min", "budget_max", "category", "city"}
+
+
+# ============================================================
+# СТРОГАЯ ВАЛИДАЦИЯ — любое несоответствие → ProcessingError
+# ============================================================
+
+class ProcessingError(Exception):
+    """Критическая ошибка цепочки. Юзеру — нейтральное, в лог — детали."""
+    pass
+
+
+def validate_nlu_output(raw_text: str) -> dict:
+    """Парсинг JSON + валидация NLU-ответа. Никаких догадок."""
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise ProcessingError(f"NLU: JSON parse error: {e}")
+    if not isinstance(data, dict):
+        raise ProcessingError("NLU: response is not dict")
+    state = data.get("state")
+    if not isinstance(state, dict):
+        raise ProcessingError(f"NLU: state missing or not dict: {type(state).__name__}")
+    error = data.get("error")
+    if error is not None and not isinstance(error, str):
+        raise ProcessingError(f"NLU: error not str: {type(error).__name__}")
+    missing_fields = data.get("missing_fields")
+    if missing_fields is not None and not isinstance(missing_fields, list):
+        raise ProcessingError(f"NLU: missing_fields not list: {type(missing_fields).__name__}")
+    has_question = data.get("has_question", False)
+    if not isinstance(has_question, bool):
+        has_question = False
+    return {"state": state, "error": error, "missing_fields": missing_fields, "has_question": has_question}
+
+
+def validate_gen_output(raw_text: str) -> dict:
+    """Парсинг JSON + валидация Gen-ответа. Никаких догадок."""
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise ProcessingError(f"Gen: JSON parse error: {e}")
+    if not isinstance(data, dict):
+        raise ProcessingError("Gen: response is not dict")
+    gen_text = data.get("text")
+    if not isinstance(gen_text, str):
+        raise ProcessingError(f"Gen: text missing or not str: {type(gen_text).__name__}")
+    gen_state = data.get("state")
+    if not isinstance(gen_state, dict):
+        raise ProcessingError(f"Gen: state missing or not dict: {type(gen_state).__name__}")
+    room_id = data.get("room_id")
+    if room_id is not None and not isinstance(room_id, int):
+        raise ProcessingError(f"Gen: invalid room_id type: {type(room_id).__name__} ({room_id!r})")
+    buttons_raw = data.get("buttons", [])
+    if not isinstance(buttons_raw, list):
+        raise ProcessingError(f"Gen: buttons not list: {type(buttons_raw).__name__}")
+    buttons = []
+    for b in buttons_raw:
+        if not isinstance(b, str):
+            raise ProcessingError(f"Gen: button not str: {b!r}")
+        try:
+            buttons.append(Button(b))
+        except ValueError:
+            raise ProcessingError(f"Gen: unknown button '{b}'")
+    show_reset = data.get("show_reset", False)
+    if not isinstance(show_reset, bool):
+        raise ProcessingError(f"Gen: show_reset not bool: {type(show_reset).__name__}")
+    summary = data.get("summary", "")
+    if not isinstance(summary, str):
+        raise ProcessingError(f"Gen: summary not str: {type(summary).__name__}")
+    return {
+        "text": gen_text, "state": gen_state, "summary": summary,
+        "room_id": room_id, "buttons": buttons, "show_reset": show_reset
+    }
+
+
+import numpy as np
+import requests
+from sentence_transformers import SentenceTransformer
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+
+# ── Config ──────────────────────────────────────────────────────
+
+def get_secret(key):
+    """Получение секрета из Colab secrets или переменных окружения."""
+    try:
+        from google.colab import userdata
+        return userdata.get(key)
+    except Exception:
+        return os.environ.get(key)
+
+BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN")
+DEEPSEEK_API_KEY = get_secret("DEEPSEEK_API_KEY")
+ALLOWED_CHAT_ID = int(get_secret("ALLOWED_CHAT_ID"))
+DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+
+DB_PATH = str(BASE_DIR / "legenda_hotels.db")
+LOG_PATH = str(BASE_DIR / "bot_log.csv")
+NLU_PROMPT_PATH = str(BASE_DIR / "prompt_nlu.txt")
+GEN_PROMPT_PATH = str(BASE_DIR / "prompt_gen.txt")
+ANALYZER_PROMPT_PATH = str(BASE_DIR / "prompt_analyzer.txt")
+CHUNKS_PATH = str(BASE_DIR / "chunks.json")
+EMBEDDINGS_PATH = str(BASE_DIR / "embeddings.npy")
+
+DEFAULT_STATE = {
+    "guest_name": None,
+    "adults": None,
+    "children": None,
+    "checkin_date": None,
+    "checkout_date": None,
+    "budget_min": None,
+    "budget_max": None,
+    "category": None,
+    "city": None,
+    "awaiting": "guest_name",
+    "shown_rooms": [],
+    "last_room_id": None,
+    "searched": False
+}
+
+# ── Logging ─────────────────────────────────────────────────────
+
+logging.basicConfig(level=logging.ERROR, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def log_action(chat_id, direction, action, source, detail):
+    """Запись действия в CSV-лог."""
+    try:
+        with open(LOG_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([chat_id, direction, action, source, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(detail)[:500]])
+    except Exception:
+        pass
+
+
+# ============================================================
+# RAG — модель, чанки, эмбеддинги, поиск
+# ============================================================
+
+_MODEL = None
+_CHUNKS = None
+_EMBEDDINGS = None
+
+
+def load_rag_model():
+    """Загрузка SentenceTransformer для семантического поиска."""
+    global _MODEL
+    if _MODEL is None:
+        _MODEL = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    return _MODEL
+
+
+def load_chunks():
+    """Загрузка чанков из chunks.json (отели + номера)."""
+    global _CHUNKS
+    if _CHUNKS is None:
+        with open(CHUNKS_PATH, "r", encoding="utf-8") as f:
+            _CHUNKS = json.load(f)
+    return _CHUNKS
+
+
+def load_embeddings():
+    """Загрузка эмбеддингов из embeddings.npy."""
+    global _EMBEDDINGS
+    if _EMBEDDINGS is None:
+        _EMBEDDINGS = np.load(EMBEDDINGS_PATH)
+    return _EMBEDDINGS
+
+
+def search_rag(query, top_k=20):
+    """
+    Векторный поиск по чанкам с использованием косинусной близости.
+
+    Args:
+        query: текст запроса
+        top_k: количество результатов
+
+    Returns:
+        list[dict]: чанки, отсортированные по релевантности
+    """
+    model = load_rag_model()
+    chunks = load_chunks()
+    embeddings = load_embeddings()
+    q_emb = model.encode(query, normalize_embeddings=True)
+    scores = embeddings @ q_emb
+    top_indices = np.argsort(scores)[::-1][:top_k]
+    results = [chunks[i] for i in top_indices]
+    log_action("system", "in", "search", "rag", f"query={query[:200]}, top={len(results)}")
+    return results
+
+
+def extract_price(price_str):
+    """Извлечение числового значения цены из строки вида 'от 5 000 руб/ночь'."""
+    if not price_str:
+        return None
+    digits = re.sub(r"[^\d]", "", price_str)
+    return int(digits) if digits else None
+
+
+def get_cheapest_room():
+    """Поиск самого дешёвого номера среди всех чанков."""
+    cheapest = None
+    min_price = float("inf")
+    for c in load_chunks():
+        if c.get("type") == "room":
+            price = extract_price(c.get("price"))
+            if price and price < min_price:
+                min_price = price
+                cheapest = c
+    return cheapest, min_price if min_price != float("inf") else None
+
+
+def tier_rank(tier_name):
+    """Ранг класса (люкс=7, ..., эконом=1). Неизвестный → 0."""
+    return TIER_RANK.get(tier_name, 0)
+
+
+def sort_by_tier(rooms):
+    """Сортировка номеров: сначала дорогой класс, потом цена."""
+    rooms.sort(key=lambda c: (
+        -tier_rank(c.get("tier")),
+        c.get("price_num") or extract_price(c.get("price")) or 999999
+    ))
+
+
+# ============================================================
+# LLM — вызов DeepSeek, парсинг, NLU и Gen обёртки
+# ============================================================
+
+_NLU_PROMPT = None
+_GEN_PROMPT = None
+_ANALYZER_PROMPT = None
+
+
+def load_prompt(path):
+    """Загрузка системного промпта из файла."""
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def get_nlu_prompt():
+    """Кешированная загрузка NLU-промпта."""
+    global _NLU_PROMPT
+    if _NLU_PROMPT is None:
+        _NLU_PROMPT = load_prompt(NLU_PROMPT_PATH)
+    return _NLU_PROMPT
+
+
+def get_gen_prompt():
+    """Кешированная загрузка Gen-промпта."""
+    global _GEN_PROMPT
+    if _GEN_PROMPT is None:
+        _GEN_PROMPT = load_prompt(GEN_PROMPT_PATH)
+    return _GEN_PROMPT
+
+
+def call_deepseek_raw(system_prompt, request_body):
+    """
+    Низкоуровневый вызов DeepSeek API.
+
+    Args:
+        system_prompt: системный промпт
+        request_body: dict с данными запроса
+
+    Returns:
+        str: текст ответа от LLM
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": json.dumps(request_body, ensure_ascii=False)}
+    ]
+    payload = {
+        "model": "deepseek-chat",
+        "messages": messages,
+        "temperature": 0.3,
+        "max_tokens": 1024
+    }
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    try:
+        resp = requests.post(DEEPSEEK_API_URL, json=payload, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error("DeepSeek API error: %s", e)
+        raise ProcessingError(f"DeepSeek API: {e}")
+
+
+def call_nlu(state, summary, user_message, date_str):
+    """Вызов NLU-агента с ретраем при JSON-ошибке (до 2 повторений)."""
+    request = {
+        "user_message": user_message,
+        "state": state,
+        "summary": summary,
+        "date": date_str
+    }
+    last_error = None
+    for attempt in range(3):
+        raw = call_deepseek_raw(get_nlu_prompt(), request)
+        try:
+            return parse_nlu_response(raw)
+        except ProcessingError as e:
+            last_error = e
+            if attempt < 2:
+                continue
+    raise last_error
+
+
+def call_analyzer(state, summary, user_message, date_str):
+    """Вызов Analyzer-агента с ретраем при JSON-ошибке (до 2 повторений)."""
+    request = {
+        "user_message": user_message,
+        "state": state,
+        "summary": summary,
+        "date": date_str
+    }
+    last_error = None
+    for attempt in range(3):
+        raw = call_deepseek_raw(get_analyzer_prompt(), request)
+        try:
+            return parse_analyzer_response(raw)
+        except ProcessingError as e:
+            last_error = e
+            if attempt < 2:
+                continue
+    raise last_error
+
+
+def parse_analyzer_response(raw_text: str) -> list:
+    """Парсинг JSON-ответа от Analyzer-агента."""
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise ProcessingError(f"Analyzer: JSON parse error: {e}")
+    paths = data.get("paths", [])
+    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+        raise ProcessingError(f"Analyzer: invalid paths: {paths!r}")
+    return paths
+
+
+def get_analyzer_prompt():
+    """Кешированная загрузка Analyzer-промпта."""
+    global _ANALYZER_PROMPT
+    if _ANALYZER_PROMPT is None:
+        _ANALYZER_PROMPT = load_prompt(ANALYZER_PROMPT_PATH)
+    return _ANALYZER_PROMPT
+
+
+def call_gen(gen_type, state, summary, results, current_index, user_message):
+    """Вызов Generation-агента с ретраем при JSON-ошибке (до 2 повторений)."""
+    request = {
+        "type": gen_type,
+        "state": state,
+        "summary": summary,
+        "results": results,
+        "results_total": len(results),
+        "current_index": current_index,
+        "user_message": user_message
+    }
+    last_error = None
+    for attempt in range(3):
+        raw = call_deepseek_raw(get_gen_prompt(), request)
+        try:
+            return parse_gen_response(raw)
+        except ProcessingError as e:
+            last_error = e
+            if attempt < 2:
+                continue
+    raise last_error
+
+
+def parse_nlu_response(text):
+    """Парсинг JSON-ответа от NLU-агента. Строгая валидация."""
+    return validate_nlu_output(text)
+
+
+def parse_gen_response(text):
+    """Парсинг JSON-ответа от Generation-агента. Строгая валидация."""
+    return validate_gen_output(text)
+
+
+# ============================================================
+# АГЕНТЫ — чистые функции, без async, без side-эффектов
+# ============================================================
+
+def agent_collect_data(state):
+    """
+    Агент сбора данных. Проверяет, все ли обязательные поля заполнены.
+
+    Args:
+        state: состояние сессии (после применения NLU-обновлений)
+
+    Returns:
+        (gen_type: str, state_updates: dict)
+        gen_type: "onboarding" — ещё собираем, "onboarding_ready" — всё готово
+        state_updates: изменения для state (awaiting)
+    """
+    state_updates = {}
+    budget_ok = state.get("budget_min") is not None or state.get("budget_max") is not None
+    missing = [f for f in REQUIRED_FIELDS if state.get(f) is None]
+
+    if not missing and budget_ok:
+        state_updates["awaiting"] = None
+        return (GenType.ONBOARDING_READY.value, state_updates)
+
+    for field in REQUIRED_FIELDS:
+        if state.get(field) is None:
+            state_updates["awaiting"] = field
+            return (GenType.ONBOARDING.value, state_updates)
+
+    if not budget_ok:
+        state_updates["awaiting"] = "budget_max"
+        return (GenType.ONBOARDING.value, state_updates)
+
+    state_updates["awaiting"] = None
+    return (GenType.ONBOARDING_READY.value, state_updates)
+
+
+# ============================================================
+# АГЕНТЫ — чистые функции, без async, без side-эффектов
+# ============================================================
+
+
+def _build_search_query(state, user_text):
+    """Сборка RAG-запроса из state + текст пользователя."""
+    parts = []
+    if state.get("adults"):
+        parts.append(f"взрослых: {state['adults']}")
+    if state.get("children"):
+        parts.append(f"дети: {state['children']}")
+    if state.get("budget_max"):
+        parts.append(f"бюджет до {state['budget_max']} руб")
+    if state.get("budget_min"):
+        parts.append(f"бюджет от {state['budget_min']} руб")
+    if state.get("checkin_date"):
+        parts.append(f"заезд {state['checkin_date']}")
+    if state.get("category") and state["category"] != "любой":
+        parts.append(f"категория {state['category']}")
+    if state.get("city"):
+        parts.append(f"город {state['city']}")
+    parts.append(user_text)
+    return " ".join(parts)
+
+
+def agent_search(state, user_text, shown_rooms):
+    """
+    Агент поиска. Запускает RAG, фильтрует номера, пропускает уже показанные.
+
+    Args:
+        state: состояние сессии
+        user_text: исходный текст пользователя (для построения запроса)
+        shown_rooms: список уже показанных room_id
+
+    Returns:
+        (current_results: list, current_index: int, gen_type: str)
+        gen_type: "search" | "nothing_found"
+    """
+    query = _build_search_query(state, user_text)
+
+    search_results = search_rag(query)
+    current_results = [r for r in search_results if r.get("type") == "room"]
+
+    # Фильтр по tier: показываем от указанного класса и выше
+    cat = state.get("category")
+    if cat and cat != "любой":
+        min_rank = tier_rank(cat)
+        if min_rank > 1:
+            current_results = [
+                r for r in current_results
+                if tier_rank(r.get("tier")) >= min_rank
+            ]
+
+    # Фильтр по городу (если указан)
+    city = state.get("city")
+    if city and city != "любой":
+        current_results = [
+            r for r in current_results
+            if r.get("city") and r["city"].lower() == city.lower()
+        ]
+
+    # Фильтр по цене: в рамках бюджета
+    budget_max = state.get("budget_max")
+    budget_min = state.get("budget_min")
+    if budget_max is not None:
+        current_results = [
+            r for r in current_results
+            if (r.get("price_num") or extract_price(r.get("price")) or 0) <= budget_max
+        ]
+    if budget_min is not None:
+        current_results = [
+            r for r in current_results
+            if (r.get("price_num") or extract_price(r.get("price")) or 0) >= budget_min
+        ]
+
+    sort_by_tier(current_results)
+
+    current_index = 0
+    while current_index < len(current_results) and current_results[current_index].get("room_id") in shown_rooms:
+        current_index += 1
+
+    if not current_results:
+        return ([], 0, GenType.NOTHING_FOUND.value)
+
+    return (current_results, current_index, GenType.SEARCH.value)
+
+
+def agent_next_room(current_results, current_index, shown_rooms):
+    """
+    Агент навигации. Переключает на следующий непоказанный номер.
+
+    Args:
+        current_results: текущие результаты поиска
+        current_index: текущий индекс
+        shown_rooms: список уже показанных room_id
+
+    Returns:
+        (new_index: int, gen_type: str, room_id: int|None)
+        gen_type: "search" | "all_shown"
+    """
+    new_index = current_index + 1
+    while new_index < len(current_results) and current_results[new_index].get("room_id") in shown_rooms:
+        new_index += 1
+
+    if new_index >= len(current_results):
+        return (new_index, GenType.ALL_SHOWN.value, None)
+
+    return (new_index, GenType.SEARCH.value, current_results[new_index].get("room_id"))
+
+
+
+# ============================================================
+# ACTION HANDLERS — каждый изолирован, возвращает ActionPayload
+# ============================================================
+
+def _next_awaiting(state):
+    """Определить следующее пустое обязательное поле."""
+    for f in REQUIRED_FIELDS:
+        if state.get(f) is None:
+            return f
+    return None
+
+
+def act_greeting(chat_id, state, summary, results, index, user_text):
+    """Сброс сессии, приветствие."""
+    reset_session(chat_id)
+    profile = get_profile(chat_id)
+    state_delta = dict(DEFAULT_STATE)
+    if profile.get("guest_name"):
+        state_delta["guest_name"] = profile["guest_name"]
+        state_delta["awaiting"] = _next_awaiting(state_delta)
+        return {
+            "gen_type": GenType.ONBOARDING.value,
+            "state_delta": state_delta,
+            "results": [], "index": 0, "summary": "",
+            "extras": {}
+        }
+    return {
+        "gen_type": GenType.GREETING.value,
+        "state_delta": state_delta,
+        "results": [], "index": 0, "summary": "",
+        "extras": {}
+    }
+
+
+def act_reset(chat_id, state, summary, results, index, user_text):
+    """Сброс — начать новый сбор данных."""
+    reset_session(chat_id)
+    profile = get_profile(chat_id)
+    state_delta = dict(DEFAULT_STATE)
+    if profile.get("guest_name"):
+        state_delta["guest_name"] = profile["guest_name"]
+        state_delta["awaiting"] = _next_awaiting(state_delta)
+        return {
+            "gen_type": GenType.ONBOARDING.value,
+            "state_delta": state_delta,
+            "results": [], "index": 0, "summary": "",
+            "extras": {}
+        }
+    return {
+        "gen_type": GenType.GREETING.value,
+        "state_delta": state_delta,
+        "results": [], "index": 0, "summary": "",
+        "extras": {}
+    }
+
+
+def act_show_bookings(chat_id, state, summary, results, index, user_text):
+    """Получение списка броней."""
+    bookings = get_bookings(chat_id)
+    return {
+        "gen_type": GenType.BOOKING_LIST.value,
+        "state_delta": {},
+        "results": bookings, "index": 0, "summary": None,
+        "extras": {}
+    }
+
+
+def act_cancel_booking(chat_id, state, summary, results, index, user_text):
+    """Отмена брони. С подтверждением или выбором."""
+    booking_id = extract_booking_id(user_text)
+    if booking_id:
+        booking = get_booking_by_id(booking_id)
+        if booking:
+            return {
+                "gen_type": GenType.BOOKING_CANCELLED.value,
+                "state_delta": {}, "results": [booking],
+                "index": 0, "summary": None,
+                "extras": {"_confirm_cancel": True}
+            }
+        return {
+            "gen_type": GenType.BOOKING_CANCELLED.value,
+            "state_delta": {}, "results": [],
+            "index": 0, "summary": None, "extras": {}
+        }
+    bookings = get_bookings(chat_id)
+    if len(bookings) == 0:
+        return {
+            "gen_type": GenType.BOOKING_CANCELLED.value,
+            "state_delta": {}, "results": [],
+            "index": 0, "summary": None, "extras": {}
+        }
+    if len(bookings) == 1:
+        return {
+            "gen_type": GenType.BOOKING_CANCELLED.value,
+            "state_delta": {}, "results": bookings,
+            "index": 0, "summary": None,
+            "extras": {"_confirm_cancel": True}
+        }
+    # 2+ — показать список для выбора
+    return {
+        "gen_type": GenType.BOOKING_CANCELLED.value,
+        "state_delta": {}, "results": bookings,
+        "index": 0, "summary": None,
+        "extras": {"_pick_cancel": True}
+    }
+
+
+def act_show_photos(chat_id, state, summary, results, index, user_text):
+    """Определить room_id для фото."""
+    room_id = get_last_booking_room_id(chat_id)
+    if not room_id:
+        room_id = state.get("last_room_id")
+    state_delta = {"last_room_id": room_id} if room_id else {}
+    extras = {"_send_photos": room_id} if room_id else {}
+    return {
+        "gen_type": GenType.SHOW_PHOTOS.value,
+        "state_delta": state_delta,
+        "results": [], "index": 0, "summary": None,
+        "extras": extras
+    }
+
+
+def act_book_room(chat_id, state, summary, results, index, user_text):
+    """Подготовка к бронированию."""
+    last_id = state.get("last_room_id")
+    if last_id:
+        results = [r for r in results if r.get("room_id") == last_id]
+        index = 0
+    return {
+        "gen_type": GenType.BOOKING.value,
+        "state_delta": {},
+        "results": results, "index": index, "summary": None,
+        "extras": {"_save_booking": True}
+    }
+
+
+def act_next_room(chat_id, state, summary, results, index, user_text):
+    """Навигация: следующий номер или новый поиск."""
+    shown = state.get("shown_rooms", [])
+    if not results:
+        new_results, new_index, gen_type = agent_search(state, user_text, shown)
+        return {
+            "gen_type": gen_type,
+            "state_delta": {},
+            "results": new_results, "index": new_index, "summary": None,
+            "extras": {}
+        }
+    new_index, nav_type, _ = agent_next_room(results, index, shown)
+    return {
+        "gen_type": nav_type,
+        "state_delta": {},
+        "results": results, "index": new_index, "summary": None,
+        "extras": {}
+    }
+
+
+def act_search(chat_id, state, summary, results, index, user_text):
+    """Полноценный поиск с upsell-detection."""
+    shown = state.get("shown_rooms", [])
+    new_results, new_index, gen_type = agent_search(state, user_text, shown)
+    state_delta = {"searched": True}
+    if gen_type == GenType.SEARCH.value and new_results and state.get("category"):
+        user_tier = tier_rank(state["category"])
+        first_tier = tier_rank(new_results[new_index].get("tier")) if new_index < len(new_results) else 0
+        if first_tier > user_tier:
+            gen_type = GenType.UPSELL.value
+    return {
+        "gen_type": gen_type,
+        "state_delta": state_delta,
+        "results": new_results, "index": new_index, "summary": None,
+        "extras": {}
+    }
+
+
+def act_collect_data(chat_id, state, summary, results, index, user_text):
+    """Сбор обязательных полей (онбординг)."""
+    gen_type, state_updates = agent_collect_data(state)
+    return {
+        "gen_type": gen_type,
+        "state_delta": state_updates,
+        "results": [], "index": 0, "summary": summary,
+        "extras": {}
+    }
+
+
+def act_change(chat_id, state, summary, results, index, user_text):
+    """Пользователь хочет изменить параметры."""
+    state_delta = {"searched": False, "shown_rooms": [], "last_room_id": None}
+    return {
+        "gen_type": GenType.CHANGE.value,
+        "state_delta": state_delta,
+        "results": [], "index": 0, "summary": summary,
+        "extras": {}
+    }
+
+
+def act_budget(chat_id, state, summary, results, index, user_text):
+    """Пользователь хочет увеличить бюджет."""
+    state_delta = {"searched": False, "shown_rooms": [], "last_room_id": None}
+    return {
+        "gen_type": GenType.BUDGET.value,
+        "state_delta": state_delta,
+        "results": [], "index": 0, "summary": summary,
+        "extras": {}
+    }
+
+
+def act_show_state(chat_id, state, summary, results, index, user_text):
+    """Fallback — показать текущее состояние."""
+    return {
+        "gen_type": GenType.STATE.value,
+        "state_delta": {},
+        "results": results, "index": index, "summary": summary,
+        "extras": {}
+    }
+
+
+def act_question_room(chat_id, state, summary, results, index, user_text):
+    """Ответ на вопрос о текущем номере. Фильтрует results по last_room_id."""
+    room_id = state.get("last_room_id")
+    if room_id and results:
+        filtered = [r for r in results if r.get("room_id") == room_id]
+        if filtered:
+            return {
+                "gen_type": GenType.QUESTION.value,
+                "state_delta": {},
+                "results": filtered,
+                "index": 0, "summary": None,
+                "extras": {}
+            }
+    return {
+        "gen_type": GenType.QUESTION.value,
+        "state_delta": {},
+        "results": results, "index": 0, "summary": None,
+        "extras": {}
+    }
+
+
+PATH_TO_ACTION = {
+    "greeting":       "greeting",
+    "reset":          "reset",
+    "off_topic":      "off_topic",
+    "update_data":    "collect_data",
+    "search":         "search",
+    "next_room":      "next_room",
+    "question_room":  "question_room",
+    "book_room":      "book_room",
+    "show_bookings":  "show_bookings",
+    "cancel_booking": "cancel_booking",
+    "show_photos":    "show_photos",
+    "change_params":  "show_state",
+    "increase_budget": "budget",
+}
+
+
+def resolve_paths(paths, state):
+    """Analyzer paths → упорядоченный список имён action."""
+    SINGLE = {"greeting", "reset", "off_topic"}
+    EXCLUSIVE = {"search", "next_room", "book_room", "cancel_booking", "show_bookings", "change_params", "increase_budget"}
+
+    for p in paths:
+        if p in SINGLE:
+            return [p] if p in PATH_TO_ACTION else [p]
+
+    # Если state уже полон и поиск уже был — update_data + search → только search
+    if "update_data" in paths and "search" in paths:
+        budget_ok = state.get("budget_min") is not None or state.get("budget_max") is not None
+        if all(state.get(f) is not None for f in REQUIRED_FIELDS) and budget_ok:
+            return ["search"]
+
+    ordered = []
+    if "update_data" in paths:
+        ordered.append("update_data")
+    for p in paths:
+        if p in EXCLUSIVE:
+            ordered.append(p)
+            break
+    for p in paths:
+        if p in {"question_room", "show_photos"} and p not in ordered:
+            ordered.append(p)
+
+    return ordered if ordered else ["off_topic"]
+
+
+ACTION_HANDLERS = {
+    "greeting":      act_greeting,
+    "reset":         act_reset,
+    "off_topic":     None,  # handled inline
+    "show_bookings": act_show_bookings,
+    "cancel_booking": act_cancel_booking,
+    "show_photos":   act_show_photos,
+    "book_room":     act_book_room,
+    "next_room":     act_next_room,
+    "search":        act_search,
+    "collect_data":  act_collect_data,
+    "question_room": act_question_room,
+    "change":        act_change,
+    "budget":        act_budget,
+    "show_state":    act_show_state,
+}
+
+
+# ============================================================
+# ОРКЕСТРАТОР — async, управляет потоком: NLU → агент → Gen
+# ============================================================
+
+# ============================================================
+# ОРКЕСТРАТОР — фазы: NLU → Analyzer → Action Loop → Fallback
+# ============================================================
+
+def _state_snapshot(state):
+    """Короткий срез state для лога."""
+    keys = ["guest_name", "awaiting", "searched", "last_room_id",
+            "checkin_date", "checkout_date", "adults", "budget_min", "budget_max", "category", "city"]
+    return {k: state.get(k) for k in keys if state.get(k) is not None}
+
+
+def _phase_nlu(state, summary, user_text, date_str):
+    """Phase 1: NLU — извлечение данных из сообщения. Возвращает nlu dict."""
+    nlu = call_nlu(state, summary, user_text, date_str)
+    nlu_state = {k: v for k, v in nlu["state"].items()
+                 if k in NLU_STATE_FIELDS and v is not None}
+    state.update(nlu_state)
+    return nlu
+
+
+def _phase_analyzer(state, summary, user_text, date_str):
+    """Phase 2: Analyzer — определение путей маршрутизации. Возвращает (paths, actions)."""
+    paths = call_analyzer(state, summary, user_text, date_str)
+    actions = resolve_paths(paths, state)
+    return paths, actions
+
+
+async def _execute_action(chat_id, action, state, summary, results, idx, user_text, send_func, log_prefix, context):
+    """Execute one action iteration. Возвращает (status, summary, results, idx, has_question_handled).
+    status: 'off_topic' | 'handled' | 'sent'"""
+    if action == "off_topic":
+        gen = call_gen(GenType.OFF_TOPIC.value, state, summary, results, idx, user_text)
+        if gen["summary"]:
+            summary = gen["summary"]
+        text = sanitize_html(gen["text"])
+        log_action(chat_id, "system", "state", "before_save", json.dumps(_state_snapshot(state), ensure_ascii=False)[:500])
+        save_session(chat_id, state, summary, results, idx)
+        await send_func(text, parse_mode="HTML")
+        log_action(chat_id, "out", log_prefix, "bot", text[:200])
+        return ("off_topic", summary, results, idx, False)
+
+    action_name = PATH_TO_ACTION.get(action, action)
+    payload = ACTION_HANDLERS[action_name](chat_id, state, summary, results, idx, user_text)
+    state.update(payload["state_delta"])
+    if payload["summary"] is not None:
+        summary = payload["summary"]
+    results = payload["results"]
+    idx = payload["index"]
+
+    if payload["extras"].get("_confirm_cancel") and results:
+        b = results[0]
+        confirm_text = (
+            f"Вы уверены, что хотите отменить бронь #{b.get('booking_id', '?')}?\n\n"
+            f"🏨 {b.get('hotel', '')} — {b.get('room', '')}\n"
+            f"📅 {b.get('checkin', '?')} → {b.get('checkout', '?')}"
+        )
+        confirm_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, отменить", callback_data=f"confirm_cancel:{b['booking_id']}"),
+            InlineKeyboardButton("❌ Нет", callback_data=f"abort_cancel:{b['booking_id']}")
+        ]])
+        log_action(chat_id, "system", "state", "before_save", json.dumps(_state_snapshot(state), ensure_ascii=False)[:500])
+        save_session(chat_id, state, summary, results, idx)
+        await send_func(confirm_text, parse_mode="HTML", reply_markup=confirm_kb)
+        log_action(chat_id, "out", log_prefix, "bot", confirm_text[:200])
+        return ("handled", summary, results, idx, False)
+
+    if payload["extras"].get("_pick_cancel") and results:
+        header = "У вас несколько броней. Какую хотите отменить?"
+        await send_func(header, parse_mode="HTML")
+        log_action(chat_id, "out", log_prefix, "bot", header[:200])
+        for b in results:
+            b_text = _format_booking(b)
+            bid = b.get("booking_id")
+            if bid:
+                b_kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отменить", callback_data=f"pick_cancel:{bid}")
+                ]])
+                await send_func(b_text, parse_mode="HTML", reply_markup=b_kb)
+                log_action(chat_id, "out", log_prefix, "bot", b_text[:200])
+        log_action(chat_id, "system", "state", "before_save", json.dumps(_state_snapshot(state), ensure_ascii=False)[:500])
+        save_session(chat_id, state, summary, results, idx)
+        return ("handled", summary, results, idx, False)
+
+    log_action(chat_id, "system", "state", "before_gen", json.dumps({"gen_type": payload["gen_type"], **_state_snapshot(state)}, ensure_ascii=False)[:500])
+    gen = call_gen(payload["gen_type"], state, summary, results, idx, user_text)
+
+    text = sanitize_html(gen["text"])
+    room_id = gen["room_id"]
+    buttons = list(gen["buttons"])
+    show_reset = gen["show_reset"]
+    if gen["summary"]:
+        summary = gen["summary"]
+    gen_state = {k: v for k, v in gen["state"].items()
+                 if k in NLU_STATE_FIELDS and v is not None}
+    state.update(gen_state)
+
+    if room_id:
+        chunk = next((c for c in results if c.get("room_id") == room_id), None)
+        if chunk:
+            pn = chunk.get("price_num") or extract_price(chunk.get("price")) or 0
+            bmax, bmin = state.get("budget_max"), state.get("budget_min")
+            if (bmax is not None and pn > bmax) or (bmin is not None and pn < bmin):
+                room_id = None
+                state["last_room_id"] = None
+
+    if room_id:
+        shown = state.get("shown_rooms", [])
+        if room_id not in shown:
+            shown.append(room_id)
+        state["shown_rooms"] = shown
+        state["last_room_id"] = room_id
+        if not buttons:
+            buttons = [Button.NEXT_ROOM, Button.BOOK, Button.NOT_SUITABLE]
+        room_full = get_full_room(room_id)
+        if room_full and room_full.get("photos"):
+            if Button.PHOTO not in buttons:
+                buttons.insert(0, Button.PHOTO)
+
+    if payload["gen_type"] == GenType.BOOKING_LIST.value and results:
+        name = state.get("guest_name", "")
+        header = f"{name}, вот ваши активные бронирования:" if name else "Вот ваши активные бронирования:"
+        await send_func(header, parse_mode="HTML")
+        log_action(chat_id, "out", log_prefix, "bot", header[:200])
+        for b in results:
+            b_text = _format_booking(b)
+            bid = b.get("booking_id")
+            b_kb = None
+            if bid:
+                b_kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📷 Фото", callback_data=f"photo_bk:{bid}"),
+                    InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_bk:{bid}")
+                ]])
+            await send_func(b_text, parse_mode="HTML", reply_markup=b_kb)
+            log_action(chat_id, "out", log_prefix, "bot", b_text[:200])
+        footer = f"Всего у вас {len(results)} активных бронирований."
+        await send_func(footer, parse_mode="HTML")
+        log_action(chat_id, "out", log_prefix, "bot", footer[:200])
+        log_action(chat_id, "system", "state", "before_save", json.dumps(_state_snapshot(state), ensure_ascii=False)[:500])
+        save_session(chat_id, state, summary, results, idx)
+        return ("handled", summary, results, idx, action == "question_room")
+
+    if payload["extras"].get("_save_booking") and results:
+        save_booking(chat_id, state, results[0])
+        state["last_room_id"] = None
+        state["shown_rooms"] = []
+        results = []
+        idx = 0
+
+    log_action(chat_id, "system", "state", "before_save", json.dumps(_state_snapshot(state), ensure_ascii=False)[:500])
+    save_session(chat_id, state, summary, results, idx)
+    kb = build_keyboard(buttons, include_reset=show_reset, room_id=room_id)
+    await send_func(text, parse_mode="HTML", reply_markup=kb)
+    log_action(chat_id, "out", log_prefix, "bot", text[:200])
+
+    photo_room = payload["extras"].get("_send_photos")
+    if photo_room and context:
+        await send_room_photos(chat_id, photo_room, context)
+
+    return ("sent", summary, results, idx, action == "question_room")
+
+
+async def process_user_message(chat_id, user_text, send_func, log_prefix="message", context=None):
+    """Оркестратор: NLU → Analyzer → Action Loop → Question Fallback.
+    Любая ошибка → ProcessingError → abort."""
+    try:
+        state, summary, results, idx = get_session(chat_id)
+
+        # Phase 1: NLU
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M MSK")
+        nlu = _phase_nlu(state, summary, user_text, date_str)
+        log_action(chat_id, "system", "state", "after_nlu", json.dumps(_state_snapshot(state), ensure_ascii=False)[:500])
+
+        # Phase 2: Analyzer
+        paths, actions = _phase_analyzer(state, summary, user_text, date_str)
+        log_action(chat_id, "system", "paths", "analyzer", json.dumps({"paths": paths, "actions": actions}, ensure_ascii=False)[:500])
+
+        # Phase 3: Action loop
+        has_question_handled = False
+        for action in actions:
+            status, summary, results, idx, handled = await _execute_action(
+                chat_id, action, state, summary, results, idx, user_text, send_func, log_prefix, context)
+            if status == "off_topic":
+                return
+            if handled:
+                has_question_handled = True
+
+        # Phase 4: has_question fallback
+        if nlu.get("has_question") and not has_question_handled:
+            q_gen = call_gen(GenType.QUESTION.value, state, summary, results, idx, user_text)
+            q_text = sanitize_html(q_gen["text"])
+            await send_func(q_text, parse_mode="HTML")
+            log_action(chat_id, "out", log_prefix, "bot", q_text[:200])
+
+    except ProcessingError as e:
+        logger.error("ProcessingError: %s", e)
+        log_action(chat_id, "error", log_prefix, "processing", str(e)[:300])
+        await send_func("⚠️ Произошла внутренняя ошибка. Попробуйте ещё раз.", parse_mode="HTML")
+
+
+# ============================================================
+# CALLBACK HANDLERS
+# ============================================================
+
+async def start(update: Update, context):
+    """Обработчик команды /start. Сбрасывает сессию и приветствует."""
+    chat_id = str(update.effective_chat.id)
+    if int(chat_id) != ALLOWED_CHAT_ID:
+        await update.message.reply_text("Извините, бот недоступен.")
+        return
+    reset_session(chat_id)
+    profile = get_profile(chat_id)
+    if profile.get("guest_name"):
+        state = dict(DEFAULT_STATE)
+        state["guest_name"] = profile["guest_name"]
+        state["awaiting"] = _next_awaiting(state)
+        save_session(chat_id, state, "", [], 0)
+        text = (f"С возвращением, {profile['guest_name']}!\n\n"
+                "Давайте подберём новый номер. Для начала скажите:\n"
+                f"{'📅 На какую дату заезжаете?' if state['awaiting'] == 'checkin_date' else ''}"
+                f"{'📅 Когда выезжаете?' if state['awaiting'] == 'checkout_date' else ''}"
+                f"{'👧 Сколько гостей?' if state['awaiting'] == 'adults' else ''}")
+        await update.message.reply_text(text, parse_mode="HTML")
+        return
+    text = ("Добро пожаловать в Legenda Hotels! 🏨\n\n"
+            "Я помогу подобрать для вас идеальный номер.\n\n"
+            "Как могу к вам обращаться?")
+    await update.message.reply_text(text)
+    log_action(chat_id, "out", "message", "bot", text[:200])
+
+
+async def handle_message(update: Update, context):
+    """Обработчик текстовых сообщений от пользователя."""
+    chat_id = str(update.effective_chat.id)
+    if int(chat_id) != ALLOWED_CHAT_ID:
+        return
+    user_text = update.message.text.strip()
+    log_action(chat_id, "in", "message", "user", user_text[:200])
+
+    search_msg = await context.bot.send_message(chat_id, "🔍 Произвожу поиск...")
+    try:
+        async def send(text, **kwargs):
+            return await update.message.reply_text(text, **kwargs)
+        await process_user_message(chat_id, user_text, send, context=context)
+    finally:
+        await search_msg.delete()
+
+
+# ============================================================
+# CALLBACK HANDLERS — каждый изолирован
+# ============================================================
+
+async def _cb_send_search(chat_id, context, btn_text, log_prefix):
+    """Обёртка: отправляет 🔍 → process_user_message → удаляет 🔍."""
+    search_msg = await context.bot.send_message(chat_id, "🔍 Произвожу поиск...")
+    try:
+        async def send(text, **kwargs):
+            return await context.bot.send_message(chat_id, text, **kwargs)
+        await process_user_message(chat_id, btn_text, send, log_prefix=log_prefix, context=context)
+    finally:
+        await search_msg.delete()
+
+
+async def _cb_photo(chat_id, room_id, context):
+    """Показать фото номера + follow-up кнопки."""
+    await send_room_photos(chat_id, room_id, context)
+    state, _, _, _ = get_session(chat_id)
+    if state.get("last_room_id") == room_id and state.get("shown_rooms"):
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Показать другой", callback_data="nav:next"),
+             InlineKeyboardButton("Забронировать", callback_data="ai:Забронировать")],
+            [InlineKeyboardButton("Не подходит", callback_data="ai:Не подходит")]
+        ])
+        await context.bot.send_message(chat_id, "⬆️ Фото номера выше", reply_markup=kb)
+
+
+async def _cb_photo_bk(chat_id, booking_id, context):
+    """Показать фото комнаты из брони."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT room_id FROM bookings WHERE id=?", (booking_id,)).fetchone()
+    conn.close()
+    if row:
+        await send_room_photos(chat_id, row[0], context)
+        log_action(chat_id, "out", "callback", "bot", f"Sent photos for booking #{booking_id}")
+    else:
+        await context.bot.send_message(chat_id, "Бронь не найдена.", parse_mode="HTML")
+
+
+async def _cb_cancel_bk(chat_id, booking_id, context):
+    """Кнопка отмены из списка броней → подтверждение."""
+    booking = get_booking_by_id(booking_id)
+    if booking:
+        text = (
+            f"Вы уверены, что хотите отменить бронь #{booking_id}?\n\n"
+            f"🏨 {booking.get('hotel', '')} — {booking.get('room', '')}"
+        )
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, отменить", callback_data=f"confirm_cancel:{booking_id}"),
+            InlineKeyboardButton("❌ Нет", callback_data=f"abort_cancel:{booking_id}")
+        ]])
+        await context.bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+        log_action(chat_id, "out", "callback", "bot", text[:200])
+    else:
+        await context.bot.send_message(chat_id, "❌ Бронь не найдена.", parse_mode="HTML")
+
+
+async def _cb_confirm_cancel(chat_id, booking_id, context):
+    """Подтверждение отмены → реальная отмена."""
+    booking = cancel_booking(booking_id)
+    if booking:
+        text = (f"❌ Бронь #{booking_id} ({booking.get('hotel', '')} — "
+                f"{booking.get('room', '')}) отменена.\n\nМожет, подберём новый номер?")
+    else:
+        text = f"❌ Бронь #{booking_id} не найдена."
+    await context.bot.send_message(chat_id, text, parse_mode="HTML")
+    log_action(chat_id, "out", "callback", "bot", text[:200])
+
+
+async def _cb_abort_cancel(chat_id, context):
+    """Отказ от отмены."""
+    await context.bot.send_message(chat_id, "✅ Отмена отменена. Бронь остаётся активной.", parse_mode="HTML")
+    log_action(chat_id, "out", "callback", "bot", "cancel aborted")
+
+
+async def _cb_pick_cancel(chat_id, booking_id, context):
+    """Выбор брони из списка → подтверждение."""
+    booking = get_booking_by_id(booking_id)
+    if booking:
+        text = (
+            f"Вы уверены, что хотите отменить бронь #{booking_id}?\n\n"
+            f"🏨 {booking.get('hotel', '')} — {booking.get('room', '')}"
+        )
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, отменить", callback_data=f"confirm_cancel:{booking_id}"),
+            InlineKeyboardButton("❌ Нет", callback_data=f"abort_cancel:{booking_id}")
+        ]])
+        await context.bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+        log_action(chat_id, "out", "callback", "bot", text[:200])
+    else:
+        await context.bot.send_message(chat_id, "❌ Бронь не найдена.", parse_mode="HTML")
+
+
+async def handle_callback(update: Update, context):
+    """Обработчик нажатий на кнопки (callback data)."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = str(update.effective_chat.id)
+    data = query.data
+    log_action(chat_id, "in", "callback", "user", data)
+    await query.edit_message_reply_markup(reply_markup=None)
+
+    if data == "nav:next":
+        await _cb_send_search(chat_id, context, "Показать другой", "callback_nav")
+    elif data.startswith("photo:"):
+        await _cb_photo(chat_id, int(data.split(":", 1)[1]), context)
+    elif data.startswith("photo_bk:"):
+        await _cb_photo_bk(chat_id, int(data.split(":", 1)[1]), context)
+    elif data.startswith("cancel_bk:"):
+        await _cb_cancel_bk(chat_id, int(data.split(":", 1)[1]), context)
+    elif data.startswith("confirm_cancel:"):
+        await _cb_confirm_cancel(chat_id, int(data.split(":", 1)[1]), context)
+    elif data.startswith("abort_cancel:"):
+        await _cb_abort_cancel(chat_id, context)
+    elif data.startswith("pick_cancel:"):
+        await _cb_pick_cancel(chat_id, int(data.split(":", 1)[1]), context)
+    elif data == "nav:reset":
+        reset_session(chat_id)
+        text = "Подбор начат заново!\n\nКак могу к вам обращаться?"
+        await context.bot.send_message(chat_id, text, parse_mode="HTML")
+        log_action(chat_id, "out", "callback", "bot", text[:200])
+    elif data == "nav:fix_params":
+        await _cb_send_search(chat_id, context, "Внести исправления", "callback_nav")
+    elif data == "nav:show_bookings":
+        await _cb_send_search(chat_id, context, "Мои брони", "callback_nav")
+    elif data == "ai:Не подходит":
+        text = ("Все варианты не подошли. Что бы вы хотели поменять?\n\n"
+                "Напишите — я помогу:\n"
+                "• Увеличить бюджет\n"
+                "• Изменить даты\n"
+                "• Другую категорию номера\n"
+                "• Или любые другие пожелания")
+        await context.bot.send_message(chat_id, text, parse_mode="HTML")
+        log_action(chat_id, "out", "callback", "bot", text[:200])
+    elif data.startswith("ai:"):
+        await _cb_send_search(chat_id, context, data[3:], "callback_ai")
+    else:
+        log_action(chat_id, "error", "callback", "unknown", f"Unknown callback: {data}")
+
+
+async def logs(update: Update, context):
+    """Обработчик команды /logs — показывает последние 10 записей лога."""
+    chat_id = str(update.effective_chat.id)
+    if int(chat_id) != ALLOWED_CHAT_ID:
+        return
+    try:
+        log_path = Path(LOG_PATH)
+        if not log_path.exists():
+            await update.message.reply_text("Логов пока нет.")
+            return
+        with open(log_path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+        if len(rows) < 2:
+            await update.message.reply_text("Логов пока нет.")
+            return
+        tail = rows[-25:] if len(rows) > 25 else rows
+        lines = []
+        for r in tail:
+            if len(r) > 5:
+                lines.append(" | ".join(r[1:5] + [r[5][:200]]))
+            else:
+                lines.append(" | ".join(r))
+        block = "\n".join(lines)
+        if len(block) > 3900:
+            block = block[:3900] + "\n…"
+        await update.message.reply_text(block)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+
+# ============================================================
+# СЕССИЯ — работа с SQLite
+# ============================================================
+
+def get_session(chat_id):
+    """
+    Загрузка сессии пользователя из БД.
+
+    Args:
+        chat_id: ID чата
+
+    Returns:
+        (state: dict, summary: str, current_results: list, current_index: int)
+    """
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT state, summary, current_results, current_index FROM sessions WHERE chat_id=?",
+        (chat_id,)
+    ).fetchone()
+    if row:
+        state = json.loads(row[0])
+        summary = row[1] or ""
+        try:
+            current_results = json.loads(row[2]) if row[2] else []
+        except json.JSONDecodeError:
+            current_results = []
+        current_index = row[3] or 0
+    else:
+        state = dict(DEFAULT_STATE)
+        summary = ""
+        current_results = []
+        current_index = 0
+        conn.execute(
+            "INSERT INTO sessions (chat_id, state, summary, current_results, current_index) VALUES (?,?,?,?,?)",
+            (chat_id, json.dumps(state), "", "[]", 0)
+        )
+        conn.commit()
+    conn.close()
+    return state, summary, current_results, current_index
+
+
+def save_session(chat_id, state, summary=None, current_results=None, current_index=None):
+    """Сохранение сессии пользователя в БД через INSERT OR REPLACE."""
+    conn = sqlite3.connect(DB_PATH)
+    s = summary if summary is not None else ""
+    cr = json.dumps(current_results, ensure_ascii=False) if current_results is not None else "[]"
+    ci = current_index if current_index is not None else 0
+    conn.execute(
+        "INSERT OR REPLACE INTO sessions (chat_id, state, summary, current_results, current_index) VALUES (?,?,?,?,?)",
+        (chat_id, json.dumps(state, ensure_ascii=False), s, cr, ci)
+    )
+
+    # Save guest_name to profiles
+    gn = state.get("guest_name")
+    if gn:
+        conn.execute(
+            "INSERT OR REPLACE INTO profiles (chat_id, guest_name) VALUES (?,?)",
+            (str(chat_id), gn)
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def reset_session(chat_id):
+    """Полный сброс сессии пользователя."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM sessions WHERE chat_id=?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_profile(chat_id):
+    """Загрузка сохранённого профиля пользователя."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT guest_name FROM profiles WHERE chat_id=?",
+        (str(chat_id),)
+    ).fetchone()
+    conn.close()
+    return {"guest_name": row[0]} if row else {}
+
+
+# ============================================================
+# ПОМОЩНИКИ
+# ============================================================
+
+def sanitize_html(text):
+    """Очистка HTML: замена <br> на \n, схлопывание множественных переносов."""
+    text = re.sub(r"</?br\s*/?>", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def build_keyboard(buttons, include_reset=False, room_id=None):
+    """
+    Построение Inline-клавиатуры из enum Button.
+
+    Args:
+        buttons: список Button
+        include_reset: добавить RESET в конец
+        room_id: ID номера (для PHOTO)
+
+    Returns:
+        InlineKeyboardMarkup | None
+    """
+    if not buttons and not include_reset:
+        return None
+    kb = []
+    for btn in buttons:
+        if not isinstance(btn, Button):
+            continue
+        label = BUTTON_LABELS[btn]
+        cb = BUTTON_CALLBACKS[btn](room_id)
+        kb.append([InlineKeyboardButton(label, callback_data=cb)])
+    if include_reset:
+        kb.append([InlineKeyboardButton(BUTTON_LABELS[Button.RESET], callback_data="nav:reset")])
+    return InlineKeyboardMarkup(kb) if kb else None
+
+
+def get_full_room(room_id):
+    """
+    Получение полной информации о номере из БД (включая фото).
+
+    Args:
+        room_id: ID номера
+
+    Returns:
+        dict | None: {"title": str, "hotel_name": str, "photos": [dict]}
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        room = conn.execute("SELECT id, title FROM room_types WHERE id=?", (room_id,)).fetchone()
+        if not room:
+            conn.close()
+            return None
+        photos = conn.execute(
+            "SELECT name, url, data_base64 FROM photos WHERE room_id=? LIMIT 10",
+            (room_id,)
+        ).fetchall()
+        conn.close()
+
+        # Ищем название отеля в чанках
+        hotel_name = ""
+        for c in load_chunks():
+            if c.get("type") == "room" and c.get("room_id") == room_id:
+                hotel_name = c.get("hotel_name", "")
+                break
+
+        return {
+            "title": room[1],
+            "hotel_name": hotel_name,
+            "photos": [{"name": p[0], "url": p[1], "data_base64": p[2]} for p in photos]
+        }
+    except Exception as e:
+        logger.error("get_full_room error: %s", e)
+        return None
+
+
+async def send_room_photos(chat_id, room_id, context):
+    """Отправка всех фото номера медиа-группой."""
+    room_data = get_full_room(room_id)
+    if not room_data or not room_data.get("photos"):
+        await context.bot.send_message(chat_id, "Фото для этого номера недоступны.")
+        return
+    media = []
+    for p in room_data["photos"][:10]:
+        try:
+            img_bytes = base64.b64decode(p["data_base64"])
+            media.append(InputMediaPhoto(io.BytesIO(img_bytes)))
+        except Exception:
+            continue
+    if media:
+        try:
+            await context.bot.send_media_group(chat_id, media=media)
+        except Exception:
+            for m in media:
+                try:
+                    await context.bot.send_photo(chat_id, m.media)
+                except Exception:
+                    continue
+        names = [p.get("name", "") for p in room_data["photos"][:3]]
+        log_action(chat_id, "out", "photo", "bot", f"Sent {len(media)} photos: {', '.join(names)}")
+
+
+# ── Бронирования ──────────────────────────────────────────────
+
+# ============================================================
+# БРОНИРОВАНИЯ — CRUD + форматирование
+# ============================================================
+
+
+def _format_booking(b):
+    """Одна бронь → HTML-строка."""
+    parts = [f"🏨 <b>Бронь #{b.get('booking_id', '?')}</b>"]
+    hotel = b.get("hotel", "")
+    room = b.get("room", "")
+    tier = b.get("tier", "")
+    if hotel:
+        parts.append(f"🏨 {hotel}" + (f" — {room} ({tier})" if room else ""))
+    elif room:
+        parts.append(f"🛏️ {room}" + (f" ({tier})" if tier else ""))
+    parts.append(f"📅 {b.get('checkin', '?')} → {b.get('checkout', '?')}")
+    parts.append(f"👥 {b.get('guests', '?')}")
+    price = b.get("price", "")
+    if price:
+        parts.append(f"💰 {price}")
+    return "\n".join(parts)
+
+
+def save_booking(chat_id, state, room_data):
+    """Сохранение бронирования в БД."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        INSERT INTO bookings (chat_id, room_id, hotel_name, room_title, tier, price,
+                              checkin, checkout, guests, status, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        str(chat_id),
+        room_data.get("room_id"),
+        room_data.get("hotel_name") or room_data.get("hotel", ""),
+        room_data.get("room_title") or room_data.get("room") or room_data.get("title", ""),
+        room_data.get("tier"),
+        room_data.get("price"),
+        state.get("checkin_date"),
+        state.get("checkout_date"),
+        f"{state.get('adults', '?')} взрослых" + (f", {state.get('children')} детей" if state.get('children') else ""),
+        "active",
+        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_bookings(chat_id):
+    """Получение активных броней пользователя."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id, room_id, hotel_name, room_title, tier, price, "
+        "checkin, checkout, guests, created_at FROM bookings "
+        "WHERE chat_id=? AND status='active' ORDER BY created_at DESC",
+        (str(chat_id),)
+    ).fetchall()
+    conn.close()
+    return [{
+        "booking_id": r[0],
+        "room_id": r[1],
+        "hotel": r[2],
+        "room": r[3],
+        "tier": r[4],
+        "price": r[5],
+        "checkin": r[6],
+        "checkout": r[7],
+        "guests": r[8],
+        "created_at": r[9]
+    } for r in rows]
+
+
+def cancel_booking(booking_id):
+    """Отмена бронирования. Возвращает данные отменённой брони."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT id, room_id, hotel_name, room_title, tier, price, "
+        "checkin, checkout, guests, created_at FROM bookings WHERE id=?",
+        (booking_id,)
+    ).fetchone()
+    if row:
+        conn.execute("UPDATE bookings SET status='cancelled' WHERE id=?", (booking_id,))
+        conn.commit()
+    conn.close()
+    if row:
+        return {
+            "booking_id": row[0], "room_id": row[1],
+            "hotel": row[2], "room": row[3], "tier": row[4],
+            "price": row[5], "checkin": row[6], "checkout": row[7],
+            "guests": row[8], "created_at": row[9]
+        }
+    return None
+
+
+def get_booking_by_id(booking_id):
+    """Получение активной брони по ID (без отмены)."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT id, room_id, hotel_name, room_title, tier, price, "
+        "checkin, checkout, guests FROM bookings WHERE id=? AND status='active'",
+        (booking_id,)
+    ).fetchone()
+    conn.close()
+    if row:
+        return {"booking_id": row[0], "room_id": row[1], "hotel": row[2],
+                "room": row[3], "tier": row[4], "price": row[5],
+                "checkin": row[6], "checkout": row[7], "guests": row[8]}
+    return None
+
+
+def extract_booking_id(text):
+    """Извлечение ID брони из текста ('отмени бронь 1', 'бронь #5')."""
+    m = re.search(r'(?:бронь|брони|броня|booking|id)\s*[#№]?\s*(\d+)', text, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def get_last_booking_room_id(chat_id):
+    """Получение room_id последнего активного бронирования."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT room_id FROM bookings WHERE chat_id=? AND status='active' ORDER BY created_at DESC LIMIT 1",
+        (str(chat_id),)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def format_price(price):
+    """Форматирование цены: 12345 → '12 345'."""
+    s = str(int(price))
+    parts = []
+    while len(s) > 3:
+        parts.insert(0, s[-3:])
+        s = s[:-3]
+    parts.insert(0, s)
+    return " ".join(parts)
+
+
+# ============================================================
+# ЗАПУСК БОТА
+# ============================================================
+
+def init_session_table():
+    """Создание таблицы sessions, если её нет."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            chat_id TEXT PRIMARY KEY,
+            state TEXT DEFAULT '{}',
+            summary TEXT DEFAULT '',
+            current_results TEXT DEFAULT '[]',
+            current_index INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bookings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            room_id INTEGER,
+            hotel_name TEXT,
+            room_title TEXT,
+            tier TEXT,
+            price TEXT,
+            checkin TEXT,
+            checkout TEXT,
+            guests TEXT,
+            status TEXT DEFAULT 'active',
+            created_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            chat_id TEXT PRIMARY KEY,
+            guest_name TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def main():
+    """Точка входа: загрузка моделей, инициализация БД, запуск polling."""
+    print("Loading RAG model...")
+    load_rag_model()
+    print(f"Model loaded. Dim: {load_rag_model().get_sentence_embedding_dimension()}")
+
+    print("Loading chunks & embeddings...")
+    chunks = load_chunks()
+    embeddings = load_embeddings()
+    print(f"Chunks: {len(chunks)}, Embeddings: {embeddings.shape}")
+
+    print("Starting bot...")
+    init_session_table()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("logs", logs))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    import nest_asyncio
+    nest_asyncio.apply()
+    main()
+
+Execution count: None
+Executed: False
+Executed by: Unknown
+Executed at: Unknown
+----------
+
+=====================
